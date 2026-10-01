@@ -15,13 +15,16 @@
         - already registered -> updates the group tag in place
         - new device         -> reads the hardware hash and uploads
                                 it with the chosen group tag
-   4. Writes a log file - next to this script on a flash drive,
+   4. Waits for Intune to assign an Autopilot profile (usually 10-15
+      minutes). If none is assigned within 30 minutes, it stops
+      without restarting or resetting - run it again later.
+   5. Writes a log file - next to this script on a flash drive,
       otherwise in C:\ProgramData\AutopilotEnroll.
-   5. Hands the device back to a clean OOBE:
+   6. Hands the device back to a clean OOBE:
         - still in OOBE  -> restarts (nothing to reset)
         - fully built PC -> resets ("remove everything"), then restarts
       A 30 second countdown allows you to cancel. Nothing is wiped
-      unless the upload succeeded first.
+      unless the upload succeeded and a profile was assigned first.
 
  *** THE RESET ERASES ALL DATA ON THE DEVICE. Only run this on new or
  *** already-backed-up machines.
@@ -56,8 +59,10 @@ $AppId    = '06658403-c7c5-4588-800e-7929036f18e1'
 $TagSelectTimeoutSeconds = 15
 
 # Set to $true to make the script wait until the Autopilot profile is
-# assigned before finishing. Accurate, but can add 10-15 minutes.
-$WaitForProfileAssignment = $false
+# assigned before finishing. Accurate, but can add 10-15 minutes. If no
+# profile is assigned within 30 minutes, the device is left registered
+# but is not restarted or reset - run the script again later.
+$WaitForProfileAssignment = $true
 
 # What to do after a SUCCESSFUL upload:
 #   'Auto'   - restart if the device is still in OOBE (nothing to reset),
@@ -77,7 +82,7 @@ $CountdownSeconds = 30
 #  Nothing below here needs editing.
 # ===================================================================
 
-$ScriptVersion = '2026-09-24.4-internal'   # bump when editing
+$ScriptVersion = '2026-10-01.1-internal'   # bump when editing
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
@@ -1049,7 +1054,8 @@ Write-Host '   Group tag  : ' -NoNewline
 Write-Host $tagToApply -ForegroundColor Green
 Write-Rule
 Write-Host ''
-Write-Host '  Starting enrollment. This usually takes 2-5 minutes. Do not close' -ForegroundColor Gray
+$duration = if ($WaitForProfileAssignment) { '15-20 minutes' } else { '2-5 minutes' }
+Write-Host "  Starting enrollment. This usually takes $duration. Do not close" -ForegroundColor Gray
 Write-Host '  this window or restart the device until it says COMPLETE.'          -ForegroundColor Gray
 
 
@@ -1115,15 +1121,6 @@ if (-not $existing) {
         $registered = Wait-AutopilotDevice -Token $graphToken -Serial $Serial -Minutes 10
         if ($registered) {
             Write-Ok 'The device is listed in Intune.'
-            if ($WaitForProfileAssignment) {
-                Write-Step 'Waiting for the Autopilot profile to be assigned (can take 10-15 minutes)'
-                if (Wait-ProfileAssignment -Token $graphToken -Id $registered.id -Minutes 30) {
-                    Write-Ok 'Autopilot profile assigned.'
-                } else {
-                    Write-Warn 'No profile assigned yet. Until it is, the device will not show'
-                    Write-Warn 'the Autopilot experience.'
-                }
-            }
         } else {
             Write-Warn 'The device is registered but not listed in Intune yet. It usually'
             Write-Warn 'appears within a few minutes.'
@@ -1132,9 +1129,27 @@ if (-not $existing) {
 }
 
 
+# --- Autopilot profile ----------------------------------------------
+# Without a profile the device boots to the normal OOBE instead of
+# Autopilot, so don't report COMPLETE, restart or reset until it has one.
+
+$profileOk = -not $WaitForProfileAssignment
+$deviceId  = if ($existing) { $existing.id } elseif ($registered) { $registered.id }
+
+if ($uploadOk -and -not $profileOk -and $deviceId) {
+    Write-Step 'Waiting for the Autopilot profile to be assigned (can take 10-15 minutes)'
+    $profileOk = Wait-ProfileAssignment -Token $graphToken -Id $deviceId -Minutes 30
+    if ($profileOk) {
+        Write-Ok 'Autopilot profile assigned.'
+    } else {
+        Write-Warn 'No Autopilot profile assigned after 30 minutes.'
+    }
+}
+
+
 # --- Result ---------------------------------------------------------
 Write-Host ''
-if ($uploadOk) {
+if ($uploadOk -and $profileOk) {
     Write-Host '  ===============================================================' -ForegroundColor Green
     Write-Host '                    E N R O L L M E N T   C O M P L E T E'         -ForegroundColor Green
     Write-Host '  ===============================================================' -ForegroundColor Green
@@ -1203,6 +1218,21 @@ if ($uploadOk) {
         Write-Host  '   Reset this PC > Remove everything.'
         Exit-Script -Code 2
     }
+} elseif ($uploadOk) {
+    Write-Host '  ===============================================================' -ForegroundColor Yellow
+    Write-Host '                P R O F I L E   N O T   A S S I G N E D'           -ForegroundColor Yellow
+    Write-Host '  ===============================================================' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host "   The device IS registered with Autopilot as '$tagToApply', but no"
+    Write-Host '   Autopilot profile has been assigned to it yet. It has NOT been'
+    Write-Host '   restarted or reset - without a profile it would not show the'
+    Write-Host '   Autopilot experience.'
+    Write-Host ''
+    Write-Host '   Run this script again in a few minutes. It will find the device'
+    Write-Host '   already registered and only wait for the profile.'
+    Write-Host ''
+    Write-Host "   Log: $LogPath" -ForegroundColor Yellow
+    Exit-Script -Code 3
 } else {
     Write-Host '  ===============================================================' -ForegroundColor Red
     Write-Host '                  E N R O L L M E N T   F A I L E D'               -ForegroundColor Red
