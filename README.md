@@ -22,9 +22,11 @@ Registers a Windows device with Windows Autopilot, applies its group tag, and ha
 
    Only continue if your phone says you're signing in to **FinQuery Autopilot Enrollment** and you started the sign-in on the device in front of you.
 
-5. Wait for **ENROLLMENT COMPLETE**. Don't close the window or restart the device before then. The script registers the device, or updates its group tag if it's already registered.
+5. Wait for **ENROLLMENT COMPLETE**. This usually takes 15-20 minutes. Don't close the window or restart the device before then. The script registers the device, or updates its group tag if it's already registered, then waits for Intune to assign it an Autopilot profile.
    - A new device restarts into Autopilot.
    - A device that's already set up is reset, then restarts. Press any key during the 30-second countdown to cancel the reset.
+
+If the screen says **PROFILE NOT ASSIGNED**, the device is registered but didn't get an Autopilot profile within 30 minutes. It isn't restarted or reset. Run the script again in a few minutes: it finds the device already registered and only waits for the profile.
 
 If enrollment fails, nothing on the device is changed. Note the message on screen and check the log.
 
