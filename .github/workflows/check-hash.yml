@@ -1,0 +1,37 @@
+name: Check pinned hash
+
+# go.ps1 refuses to run Enroll-Autopilot-Internal.ps1 unless its SHA256
+# matches $ExpectedSha256. This fails the pull request when they disagree,
+# so a forgotten hash update can't break enrollment for everyone.
+#
+# Uses plain git rather than actions/checkout: this repo only allows
+# LeaseQuery's own actions, and the check doesn't need any others.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check-hash:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the files being checked
+        run: |
+          git init -q .
+          git fetch -q --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: go.ps1 pins the current enrollment script
+        run: |
+          expected=$(grep -E '^\$ExpectedSha256' go.ps1 | grep -oE '[0-9a-f]{64}')
+          actual=$(sha256sum Enroll-Autopilot-Internal.ps1 | cut -d' ' -f1)
+          echo "go.ps1 expects : ${expected:-(not found)}"
+          echo "script hashes to: $actual"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error file=go.ps1::Set \$ExpectedSha256 to $actual"
+            exit 1
+          fi
