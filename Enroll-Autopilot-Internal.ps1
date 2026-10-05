@@ -82,14 +82,14 @@ $CountdownSeconds = 30
 #  Nothing below here needs editing.
 # ===================================================================
 
-$ScriptVersion = '2026-10-01.1-internal'   # bump when editing
+$ScriptVersion = '2026-10-05.1-internal'   # bump when editing, then update the hash in go.ps1
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 # On a flash drive the log goes next to the script, as before. When the
-# script was downloaded to this PC, it goes somewhere that outlasts OOBE.
-$LogDir  = if ($ScriptDir -like "$env:SystemDrive*") { Join-Path $env:ProgramData 'AutopilotEnroll' } else { $ScriptDir }
+# script was downloaded to this PC (go.ps1 runs it from memory, so there
+# is no $PSScriptRoot), it goes somewhere that outlasts OOBE.
+$LogDir  = if ($PSScriptRoot -and $PSScriptRoot -notlike "$env:SystemDrive*") { $PSScriptRoot } else { Join-Path $env:ProgramData 'AutopilotEnroll' }
 $Stamp   = Get-Date -Format 'yyyyMMdd-HHmmss'
 $LogPath = Join-Path $LogDir "AutopilotEnroll-$env:COMPUTERNAME-$Stamp.log"
 

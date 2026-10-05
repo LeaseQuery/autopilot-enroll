@@ -20,7 +20,7 @@ Registers a Windows device with Windows Autopilot, applies its group tag, and ha
 3. Choose the device type, then the country (or, for a test machine, the account type). See [Group tags](#group-tags). If you don't press anything, it continues as a regular US employee.
 4. When the QR code appears, scan it with your phone or open the link shown. Enter the code shown on the device, then sign in with your FinQuery account.
 
-   Only continue if your phone says you're signing in to **FinQuery Autopilot Enrollment** and you started the sign-in on the device in front of you.
+   Only enter a code that's showing on the device in front of you, from a sign-in you just started. Never enter a code that someone sends you, even if your phone says **FinQuery Autopilot Enrollment**: anyone can start a sign-in that shows that name.
 
 5. Wait for **ENROLLMENT COMPLETE**. This usually takes 15-20 minutes. Don't close the window or restart the device before then. The script registers the device, or updates its group tag if it's already registered, then waits for Intune to assign it an Autopilot profile.
    - A new device restarts into Autopilot.
@@ -55,3 +55,19 @@ Copy `Enroll-Autopilot-Internal.ps1` next to `Enroll.cmd` on the flash drive.
 ## Logs
 
 Logs are saved to `C:\ProgramData\AutopilotEnroll`, or next to the script when it runs from a flash drive. A reset erases them.
+
+## Changing the script
+
+`go.ps1` only runs `Enroll-Autopilot-Internal.ps1` if the file's SHA256 hash matches `$ExpectedSha256`. When you change the enrollment script, update the hash in the same pull request:
+
+1. Commit your change to `Enroll-Autopilot-Internal.ps1`, with `$ScriptVersion` bumped.
+2. Get the hash of the committed file. Either open the pull request, where the **Check pinned hash** check fails and shows the hash it expects, or run this on macOS or in Git Bash:
+
+   ```
+   git show HEAD:Enroll-Autopilot-Internal.ps1 | shasum -a 256
+   ```
+
+   In Git Bash on Windows, use `sha256sum` instead of `shasum -a 256`. Hash the committed file, not your working copy: Git can change line endings when it checks a file out, which changes the hash.
+3. Paste the hash into `$ExpectedSha256` in `go.ps1` and commit.
+
+For up to 5 minutes after a merge, technicians may see **not the approved version** while GitHub's cache catches up. Running it again a few minutes later fixes it.
