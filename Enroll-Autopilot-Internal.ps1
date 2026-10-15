@@ -87,7 +87,7 @@ $CountdownSeconds = 30
 #  Nothing below here needs editing.
 # ===================================================================
 
-$ScriptVersion = '2026-10-15.1-internal'   # bump when editing, then update the hash in go.ps1
+$ScriptVersion = '2026-10-15.2-internal'   # bump when editing, then update the hash in go.ps1
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
@@ -1087,14 +1087,20 @@ function Wait-ProfileAssignment {
     # can take up to 10 minutes), and then to assign it an Autopilot
     # profile. Returns $true once a profile is assigned.
     #
+    # Intune can report a status of 'unknown' for a device that has its
+    # profile, so the status alone isn't enough. A device also counts as
+    # ready once the profile it has is the one Intune intends it to have -
+    # unless its group tag was just changed (-TagChanged), when the old
+    # profile can still look intended until its groups update.
+    #
     # Waits are timed with a stopwatch, not Get-Date: Windows can correct
     # the clock or time zone soon after OOBE gets online, which would move
     # a Get-Date deadline by hours - ending a wait at once, or making it
     # run far too long.
-    param([string]$Token, [string]$Serial, [string]$Id, [int]$Minutes)
+    param([string]$Token, [string]$Serial, [string]$Id, [int]$Minutes, [switch]$TagChanged)
 
-    $timer  = [Diagnostics.Stopwatch]::StartNew()
-    $status = $null
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $shown = $null
     do {
         try {
             if (-not $Id) {
@@ -1107,13 +1113,33 @@ function Wait-ProfileAssignment {
             }
             if ($Id) {
                 # deploymentProfileAssignmentStatus is only in the Graph beta endpoint.
-                $device = Invoke-Graph -Token $Token -Uri "https://graph.microsoft.com/beta/deviceManagement/windowsAutopilotDeviceIdentities/$Id"
-                if ($device.deploymentProfileAssignmentStatus -ne $status) {
-                    $status = $device.deploymentProfileAssignmentStatus
-                    Write-Host ''
-                    Write-Host "  Profile status: $status" -ForegroundColor DarkGray
+                $uri = "https://graph.microsoft.com/beta/deviceManagement/windowsAutopilotDeviceIdentities/$Id"
+                try {
+                    $device = Invoke-Graph -Token $Token -Uri "$($uri)?`$expand=deploymentProfile,intendedDeploymentProfile"
+                } catch {
+                    if ((Get-GraphStatus $_) -ne 400) { throw }
+                    $device = Invoke-Graph -Token $Token -Uri $uri   # status only
                 }
-                if ($status -like 'assigned*') { return $true }
+                $status   = $device.deploymentProfileAssignmentStatus
+                $assigned = $device.deploymentProfile
+                $intended = $device.intendedDeploymentProfile
+
+                $now = "{0} (has: {1}; intended: {2})" -f $status,
+                       $(if ($assigned) { $assigned.displayName } else { 'none' }),
+                       $(if ($intended) { $intended.displayName } else { 'none' })
+                if ($now -ne $shown) {
+                    $shown = $now
+                    Write-Host ''
+                    Write-Host "  Profile status: $now" -ForegroundColor DarkGray
+                }
+
+                $asIntended = $assigned.id -and $assigned.id -eq $intended.id
+                if ($status -like 'assigned*' -or ($asIntended -and -not $TagChanged)) {
+                    $name = if ($assigned) { $assigned.displayName } else { '(name not available)' }
+                    Write-Host ''
+                    Write-Ok "Autopilot profile assigned: $name"
+                    return $true
+                }
             }
         } catch {
             Write-Host ''
@@ -1228,8 +1254,9 @@ Write-Host '  this window or restart the device until it says COMPLETE.'        
 # ZtdDeviceAlreadyAssigned. Update the group tag in place instead.
 
 $Serial   = (Get-CimInstance -ClassName Win32_BIOS).SerialNumber.Trim()
-$uploadOk = $false
-$existing = $null
+$uploadOk   = $false
+$existing   = $null
+$tagChanged = $false
 
 Write-Step 'Checking whether this device is already registered...'
 try {
@@ -1252,13 +1279,14 @@ if ($existing) {
             Set-AutopilotGroupTag -Token $graphToken -Id $existing.id -GroupTag $tagToApply
             Invoke-AutopilotSync -Token $graphToken
             Write-Ok "Group tag updated to '$tagToApply'."
-            $uploadOk = $true
+            $uploadOk   = $true
+            $tagChanged = $true
         } catch {
             Write-Fail "Could not update the group tag: $(Get-GraphErrorText $_)"
         }
     }
 
-    if ($uploadOk) {
+    if ($tagChanged) {
         Write-Host ''
         Write-Warn 'Group tag changes take a few minutes to flow through to the'
         Write-Warn 'dynamic group and the assigned Autopilot profile. If this device'
@@ -1299,8 +1327,7 @@ if ($uploadOk -and -not $profileOk) {
         Write-Step 'Waiting for Intune to list the device and assign its Autopilot profile (can take 15-20 minutes)'
         $minutes = 40
     }
-    $profileOk = Wait-ProfileAssignment -Token $graphToken -Serial $Serial -Id $existing.id -Minutes $minutes
-    if ($profileOk) { Write-Ok 'Autopilot profile assigned.' }
+    $profileOk = Wait-ProfileAssignment -Token $graphToken -Serial $Serial -Id $existing.id -Minutes $minutes -TagChanged:$tagChanged
 }
 
 

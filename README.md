@@ -26,7 +26,9 @@ Registers a Windows device with Windows Autopilot, applies its group tag, and ha
    - A new device restarts into Autopilot.
    - A device that's already set up is reset, then restarts. Press any key during the 30-second countdown to cancel the reset. See [How the reset works](#how-the-reset-works).
 
-If the screen says **PROFILE NOT ASSIGNED**, the device is registered but didn't get an Autopilot profile in time (30 minutes, or 40 for a new device). It isn't restarted or reset. Run the script again in a few minutes: it finds the device already registered and only waits for the profile. While it waits, the screen shows the profile status Intune reports, which is also in the log.
+If the screen says **PROFILE NOT ASSIGNED**, the device is registered but didn't get an Autopilot profile in time (30 minutes, or 40 for a new device). It isn't restarted or reset. Run the script again in a few minutes: it finds the device already registered and only waits for the profile. While it waits, the screen shows the profile status Intune reports, the profile the device has, and the profile Intune intends it to have. These are also in the log.
+
+If the device is already registered with the same group tag and already has the profile Intune intends it to have, the script continues straight away, even if Intune reports the status as `unknown`.
 
 If enrollment fails, nothing on the device is changed. Note the message on screen and check the log.
 
