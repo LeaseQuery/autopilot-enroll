@@ -16,7 +16,7 @@ $ProgressPreference    = 'SilentlyContinue'   # the progress bar slows downloads
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $source         = 'https://raw.githubusercontent.com/LeaseQuery/autopilot-enroll/main/Enroll-Autopilot-Internal.ps1'
-$ExpectedSha256 = '7b80bad71c366931fde2aeb0dece75a8d472f88ad0be8676a8709e34b771a2d0'
+$ExpectedSha256 = '14106d5ea0179c433923d2db4e1b9cfd99ab82e7acc1e56cdf560ccd8bc87954'
 
 Write-Host 'Downloading the enrollment script...' -ForegroundColor Cyan
 $bytes  = (Invoke-WebRequest -Uri $source -UseBasicParsing).RawContentStream.ToArray()

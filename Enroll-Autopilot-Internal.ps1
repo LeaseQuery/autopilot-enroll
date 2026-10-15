@@ -95,7 +95,7 @@ $CountdownSeconds = 30
 #  Nothing below here needs editing.
 # ===================================================================
 
-$ScriptVersion = '2026-10-15.3-internal'   # bump when editing, then update the hash in go.ps1
+$ScriptVersion = '2026-10-15.4-internal'   # bump when editing, then update the hash in go.ps1
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
@@ -1105,6 +1105,17 @@ function Get-AutopilotProfiles {
     }
 }
 
+function Write-WaitEvent {
+    # One line of the profile wait: the time so far, what happened, and
+    # Intune's own status in brackets for the log. Clears the waiting timer
+    # line first.
+    param([TimeSpan]$Elapsed, [string]$Text, [string]$Status, [string]$Colour = 'Gray')
+    Write-Host ("`r" + (' ' * 60) + "`r") -NoNewline
+    Write-Host ('  {0,5:m\:ss}  ' -f $Elapsed) -NoNewline -ForegroundColor DarkGray
+    Write-Host $Text -NoNewline -ForegroundColor $Colour
+    if ($Status) { Write-Host "  [$Status]" -ForegroundColor DarkGray } else { Write-Host '' }
+}
+
 function Wait-ProfileAssignment {
     # Waits for Intune to list the device, if it hasn't yet (a new device
     # can take up to 10 minutes), and then to assign it an Autopilot
@@ -1121,6 +1132,9 @@ function Wait-ProfileAssignment {
     # updated anything. If it's still on that profile after
     # $TagChangeGraceMinutes, the new tag is taken to use the same profile.
     #
+    # Each change is shown once, as a plain-English line; a timer line
+    # shows the wait in between.
+    #
     # Waits are timed with a stopwatch, not Get-Date: Windows can correct
     # the clock or time zone soon after OOBE gets online, which would move
     # a Get-Date deadline by hours - ending a wait at once, or making it
@@ -1131,14 +1145,14 @@ function Wait-ProfileAssignment {
     $shown     = $null
     $oldId     = $null
     $firstLook = $true
+    if (-not $Id) { Write-WaitEvent $timer.Elapsed 'Waiting for Intune to list the device' }
     do {
         try {
             if (-not $Id) {
                 $device = Get-AutopilotDeviceBySerial -Token $Token -Serial $Serial
                 if ($device) {
                     $Id = $device.id
-                    Write-Host ''
-                    Write-Ok 'The device is listed in Intune.'
+                    Write-WaitEvent $timer.Elapsed 'The device is listed in Intune'
                 }
             }
             if ($Id) {
@@ -1146,23 +1160,6 @@ function Wait-ProfileAssignment {
                 $status   = $device.deploymentProfileAssignmentStatus
                 $assigned = $device.deploymentProfile
                 $intended = $device.intendedDeploymentProfile
-
-                if ($TagChanged -and $firstLook) {
-                    $oldId = $assigned.id
-                    $old   = if ($assigned) { $assigned.displayName } else { 'none' }
-                    Write-Host ''
-                    Write-Host "  Profile before the tag change: $old. Waiting up to $TagChangeGraceMinutes minutes for it to change." -ForegroundColor DarkGray
-                }
-                $firstLook = $false
-
-                $now = "{0} (has: {1}; intended: {2})" -f $status,
-                       $(if ($assigned) { $assigned.displayName } else { 'none' }),
-                       $(if ($intended) { $intended.displayName } else { 'none' })
-                if ($now -ne $shown) {
-                    $shown = $now
-                    Write-Host ''
-                    Write-Host "  Profile status: $now" -ForegroundColor DarkGray
-                }
 
                 if ($assigned -and $intended) {
                     $ready = $assigned.id -eq $intended.id -and
@@ -1172,35 +1169,60 @@ function Wait-ProfileAssignment {
                     $ready = $status -in 'assignedInSync', 'assignedUnkownSyncState'
                 }
 
+                if ($TagChanged -and $firstLook) {
+                    $oldId = $assigned.id
+                    $old   = if ($assigned) { $assigned.displayName } else { 'none' }
+                    Write-WaitEvent $timer.Elapsed "Profile before the tag change: $old" $status
+                }
+                $firstLook = $false
+
+                if ($assigned -and $intended -and $assigned.id -ne $intended.id) {
+                    $text = "Switching to $($intended.displayName)"
+                } elseif ($ready) {
+                    $text = $null   # assigned, or still on the old profile: reported below
+                } elseif ($status -eq 'failed') {
+                    $text = 'Intune reports that assigning a profile failed - still waiting'
+                } elseif ($intended) {
+                    $text = "Assigning $($intended.displayName)"
+                } else {
+                    $text = 'No profile assigned yet'
+                }
+
+                if ($text -and "$text|$status" -ne $shown) {
+                    $shown = "$text|$status"
+                    Write-WaitEvent $timer.Elapsed $text $status
+                }
+
                 if ($ready -and $TagChanged -and (-not $assigned -or $assigned.id -eq $oldId)) {
                     if ($timer.Elapsed.TotalMinutes -lt $TagChangeGraceMinutes) {
                         $ready = $false
                     } else {
-                        Write-Host ''
-                        Write-Warn ("The profile hasn't changed after $TagChangeGraceMinutes minutes, so the new " +
-                                    'group tag seems to use the same profile. Continuing.')
+                        Write-WaitEvent $timer.Elapsed ("No change after $TagChangeGraceMinutes minutes, so the " +
+                                                       'new tag seems to use the same profile') -Colour Yellow
                     }
                 }
 
                 if ($ready) {
                     $name = if ($assigned) { $assigned.displayName } else { '(name not available)' }
-                    Write-Host ''
-                    Write-Ok "Autopilot profile assigned: $name"
+                    Write-WaitEvent $timer.Elapsed "Profile assigned: $name" $status -Colour Green
                     return $true
                 }
             }
         } catch {
-            Write-Host ''
-            Write-Warn "Could not check for the profile: $(Get-GraphErrorText $_)"
+            Write-WaitEvent $timer.Elapsed "Could not check: $(Get-GraphErrorText $_)" -Colour Yellow
             # Waiting longer won't fix an expired sign-in or missing access.
             if ((Get-GraphStatus $_) -in 401, 403) { return $false }
         }
-        Write-Host '.' -NoNewline -ForegroundColor DarkGray
-        Start-Sleep -Seconds 30
+
+        # Check again in 30 seconds, showing the time so far meanwhile.
+        for ($i = 0; $i -lt 3 -and $timer.Elapsed.TotalMinutes -lt $Minutes; $i++) {
+            Write-Host ("`r  Waiting... {0:m\:ss} so far (stops at {1}:00)   " -f $timer.Elapsed, $Minutes) `
+                -NoNewline -ForegroundColor DarkGray
+            Start-Sleep -Seconds 10
+        }
     } while ($timer.Elapsed.TotalMinutes -lt $Minutes)
 
-    Write-Host ''
-    Write-Warn "No Autopilot profile assigned after $Minutes minutes."
+    Write-WaitEvent $timer.Elapsed "No Autopilot profile assigned after $Minutes minutes" -Colour Yellow
     return $false
 }
 
@@ -1334,12 +1356,6 @@ if ($existing) {
         }
     }
 
-    if ($tagChanged) {
-        Write-Host ''
-        Write-Warn 'Group tag changes take a few minutes to flow through to the'
-        Write-Warn 'dynamic group and the assigned Autopilot profile. If this device'
-        Write-Warn 'is already deployed, it needs a reset to pick up a new profile.'
-    }
 }
 
 
@@ -1368,12 +1384,15 @@ $profileOk = -not $WaitForProfileAssignment
 
 if ($uploadOk -and -not $profileOk) {
     # A new device has to be listed in Intune first, so it gets longer.
-    if ($existing) {
-        Write-Step 'Waiting for the Autopilot profile to be assigned (can take 10-15 minutes)'
+    if (-not $existing) {
+        Write-Step 'Waiting for Intune to list the device and assign its Autopilot profile (usually 15-20 minutes)'
+        $minutes = 40
+    } elseif ($tagChanged) {
+        Write-Step 'Waiting for Intune to give the device its new tag''s profile (usually 5-15 minutes)'
         $minutes = 30
     } else {
-        Write-Step 'Waiting for Intune to list the device and assign its Autopilot profile (can take 15-20 minutes)'
-        $minutes = 40
+        Write-Step 'Checking the Autopilot profile'
+        $minutes = 30
     }
     $profileOk = Wait-ProfileAssignment -Token $graphToken -Serial $Serial -Id $existing.id -Minutes $minutes -TagChanged:$tagChanged
 }
