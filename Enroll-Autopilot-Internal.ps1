@@ -16,13 +16,17 @@
         - new device         -> reads the hardware hash and uploads
                                 it with the chosen group tag
    4. Waits for Intune to assign an Autopilot profile (usually 10-15
-      minutes). If none is assigned within 30 minutes, it stops
-      without restarting or resetting - run it again later.
+      minutes). If none is assigned within 30 minutes (40 for a new
+      device, which Intune has to list first), it stops without
+      restarting or resetting - run it again later.
    5. Writes a log file - next to this script on a flash drive,
       otherwise in C:\ProgramData\AutopilotEnroll.
    6. Hands the device back to a clean OOBE:
         - still in OOBE  -> restarts (nothing to reset)
-        - fully built PC -> resets ("remove everything"), then restarts
+        - fully built PC -> resets ("remove everything"), then restarts.
+                            It asks Intune to wipe the device if it's
+                            enrolled there, and otherwise (or if the
+                            wipe doesn't arrive) resets it locally.
       A 30 second countdown allows you to cancel. Nothing is wiped
       unless the upload succeeded and a profile was assigned first.
 
@@ -60,8 +64,9 @@ $TagSelectTimeoutSeconds = 15
 
 # Set to $true to make the script wait until the Autopilot profile is
 # assigned before finishing. Accurate, but can add 10-15 minutes. If no
-# profile is assigned within 30 minutes, the device is left registered
-# but is not restarted or reset - run the script again later.
+# profile is assigned within 30 minutes (40 for a new device), the device
+# is left registered but is not restarted or reset - run the script
+# again later.
 $WaitForProfileAssignment = $true
 
 # What to do after a SUCCESSFUL upload:
@@ -82,7 +87,7 @@ $CountdownSeconds = 30
 #  Nothing below here needs editing.
 # ===================================================================
 
-$ScriptVersion = '2026-10-05.1-internal'   # bump when editing, then update the hash in go.ps1
+$ScriptVersion = '2026-10-15.1-internal'   # bump when editing, then update the hash in go.ps1
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
@@ -320,7 +325,13 @@ function Test-InOobe {
             if ($v -ne 0) { return $true }
         } catch { }
     }
-    if (Test-Path (Join-Path $env:SystemDrive 'Users\defaultuser0')) { return $true }
+    # OOBE runs as defaultuser0, but Windows often leaves that account's
+    # folder behind after setup, so checking for the folder can make a
+    # built PC look like it's in OOBE - and it's restarted, not reset.
+    # Instead: still in OOBE if no other account has a profile yet.
+    $people = Get-CimInstance -ClassName Win32_UserProfile -Filter 'Special = FALSE' -ErrorAction SilentlyContinue |
+                  Where-Object { (Split-Path $_.LocalPath -Leaf) -notlike 'defaultuser*' }
+    if (-not $people) { return $true }
     if (Get-Process -Name msoobe,oobeldr -ErrorAction SilentlyContinue) { return $true }
     if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { return $true }
     return $false
@@ -345,91 +356,191 @@ function Wait-WithCancel {
     return $true
 }
 
-function Invoke-DeviceWipe {
-    # Scripted "Reset this PC / remove everything" via the MDM RemoteWipe CSP.
-    # Uses the protected variant so an interrupted wipe resumes on next boot.
-    $namespace = 'root\cimv2\mdm\dmmap'
-    $class     = 'MDM_RemoteWipe'
-    $filter    = "ParentID='./Vendor/MSFT' and InstanceID='RemoteWipe'"
+function Enable-WinRE {
+    # Every way of resetting - an Intune wipe, the RemoteWipe CSP, Reset this
+    # PC - runs in the Windows Recovery Environment, which is often turned
+    # off on devices that were imaged. Returns $true once it's on.
+    # reagentc's text is translated, but the WinRE location it shows when
+    # WinRE is on (\\?\GLOBALROOT\device\...) isn't.
+    $ErrorActionPreference = 'Continue'   # reagentc writes to stderr; don't let that throw
+    $isOn = { ((& reagentc.exe /info) 2>&1 | Out-String) -match [regex]::Escape('\\?\GLOBALROOT') }
+    if (& $isOn) { return $true }
 
-    try {
-        $instance = Get-CimInstance -Namespace $namespace -ClassName $class -Filter $filter -ErrorAction Stop
-        $session  = New-CimSession -ErrorAction Stop
-    } catch {
-        Write-Warn "RemoteWipe CSP unavailable: $($_.Exception.Message)"
-        $instance = $null
-    }
-
-    if ($instance) {
-        foreach ($method in 'doWipeProtectedMethod','doWipeMethod') {
-            try {
-                $params = New-Object Microsoft.Management.Infrastructure.CimMethodParametersCollection
-                $params.Add([Microsoft.Management.Infrastructure.CimMethodParameter]::Create('param','','String','In'))
-                $session.InvokeMethod($namespace, $instance, $method, $params) | Out-Null
-                Write-Ok "Wipe initiated ($method). The device will restart on its own."
-                return $true
-            } catch {
-                Write-Warn "$method failed: $($_.Exception.Message)"
-            }
-        }
-    }
-
-    # Fallback 1: the built-in reset engine.
-    $sysreset = Join-Path $env:SystemRoot 'System32\systemreset.exe'
-    if (Test-Path $sysreset) {
-        foreach ($resetArg in '--factoryreset','-factoryreset') {
-            try {
-                Write-Warn "Falling back to systemreset.exe $resetArg"
-                Start-Process -FilePath $sysreset -ArgumentList $resetArg -ErrorAction Stop
-                Start-Sleep -Seconds 10
-                if (Get-Process -Name systemreset -ErrorAction SilentlyContinue) {
-                    Write-Ok 'Reset launched via systemreset.exe.'
-                    Write-Host ''
-                    Write-Host '   If a screen appears, choose: Remove everything' -ForegroundColor Yellow
-                    return $true
-                }
-                Write-Warn 'systemreset.exe exited immediately.'
-            } catch {
-                Write-Warn "systemreset.exe $resetArg failed: $($_.Exception.Message)"
-            }
-        }
-    } else {
-        Write-Warn "systemreset.exe is not present on this image ($sysreset)."
-    }
-
-    # Fallback 2: boot into the recovery environment.
-    $eap = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        Write-Warn 'Falling back to the Windows recovery environment (WinRE).'
-
-        $info = (& reagentc.exe /info) 2>&1 | Out-String
-        if ($info -notmatch 'Enabled') {
-            Write-Warn 'WinRE appears to be disabled. Attempting to enable it.'
-            (& reagentc.exe /enable) 2>&1 | Out-Null
-        }
-
-        (& reagentc.exe /boottore) 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "reagentc /boottore returned $LASTEXITCODE" }
-
-        Write-Ok 'The device will start in the recovery environment.'
-        Write-Host ''
-        Write-Host '   *** ACTION REQUIRED AFTER THE RESTART ***'               -ForegroundColor Yellow
-        Write-Host '   On the recovery screen, choose:'                         -ForegroundColor Yellow
-        Write-Host '     Troubleshoot  >  Reset this PC  >  Remove everything'  -ForegroundColor Yellow
-        Write-Host ''
-
-        if (Wait-WithCancel -Seconds 20 -ActionText 'Restarting into recovery') {
-            try { Stop-Transcript | Out-Null } catch { }
-            Restart-Computer -Force
-        }
+    Write-Warn 'The Windows Recovery Environment is off. Turning it on...'
+    $out = (& reagentc.exe /enable) 2>&1 | Out-String
+    if (& $isOn) {
+        Write-Ok 'Windows Recovery Environment turned on.'
         return $true
-    } catch {
-        Write-Warn "reagentc failed: $($_.Exception.Message)"
-    } finally {
-        $ErrorActionPreference = $eap
+    }
+    Write-Fail "Could not turn on the Windows Recovery Environment: $($out.Trim())"
+    return $false
+}
+
+function Get-IntuneEnrollments {
+    # This device's Intune enrollments, read from the device itself: the
+    # Intune device ID each one was given. Usually one; none if the device
+    # isn't enrolled in Intune.
+    foreach ($key in Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue) {
+        $enrollment = Get-ItemProperty -Path $key.PSPath -ErrorAction SilentlyContinue
+        if ($enrollment.ProviderID -ne 'MS DM Server') { continue }
+        $dmClient = Get-ItemProperty -Path (Join-Path $key.PSPath 'DMClient\MS DM Server') -ErrorAction SilentlyContinue
+        if ($dmClient.EntDMID) { $dmClient.EntDMID }
+    }
+}
+
+function Invoke-IntuneWipe {
+    # Asks Intune to wipe this device - the same as Wipe in the Intune admin
+    # center with neither box ticked. It erases everything and removes the
+    # device from Intune, but not from Autopilot. Returns $true once Intune
+    # has accepted the wipe.
+    param([string]$Token, [string]$Serial)
+
+    $ids = @(Get-IntuneEnrollments)
+    if (-not $ids) {
+        Write-Warn 'This device is not enrolled in Intune, so it will be reset locally.'
+        return $false
     }
 
+    foreach ($id in $ids) {
+        $uri = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$id"
+        try {
+            $managed = Invoke-Graph -Token $Token -Uri "$($uri)?`$select=id,deviceName,serialNumber"
+        } catch {
+            Write-Warn "Could not find Intune device $id`: $(Get-GraphErrorText $_)"
+            continue
+        }
+        # The ID came from this device, but check Intune agrees before wiping.
+        if ($managed.serialNumber -ne $Serial) {
+            Write-Warn "Intune device $id has serial number '$($managed.serialNumber)', not '$Serial'. Not wiping it."
+            continue
+        }
+        try {
+            $body = @{ keepEnrollmentData = $false; keepUserData = $false } | ConvertTo-Json
+            Invoke-Graph -Token $Token -Method POST -Uri "$uri/wipe" -Body $body | Out-Null
+            Write-Ok "Intune accepted the wipe for $($managed.deviceName)."
+            return $true
+        } catch {
+            Write-Warn "Intune did not accept the wipe: $(Get-GraphErrorText $_)"
+            return $false
+        }
+    }
+    Write-Warn 'Could not wipe this device from Intune, so it will be reset locally.'
+    return $false
+}
+
+function Start-IntuneSync {
+    # Makes the device check in with Intune now. Intune also notifies the
+    # device of the wipe; this just gets it there sooner.
+    try {
+        # What the Sync button in Settings does.
+        $null = [Windows.Management.MdmSessionManager,Windows.Management,ContentType=WindowsRuntime]
+        $null = [Windows.Management.MdmSessionManager]::TryCreateSession().StartAsync()
+        return
+    } catch { }
+    try {
+        Get-ScheduledTask -TaskName 'PushLaunch' -ErrorAction Stop | Start-ScheduledTask
+    } catch {
+        Write-Warn "Could not start an Intune sync: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-LocalWipe {
+    # "Reset this PC > Remove everything" through the RemoteWipe CSP - what
+    # an Intune wipe runs on the device. Windows only lets SYSTEM call it,
+    # not an administrator, so it runs as a one-off SYSTEM scheduled task.
+    # Returns $true once the reset has been started.
+    $call = @'
+try {
+    $ns     = 'root\cimv2\mdm\dmmap'
+    $wipe   = Get-CimInstance -Namespace $ns -ClassName MDM_RemoteWipe -Filter "ParentID='./Vendor/MSFT' and InstanceID='RemoteWipe'" -ErrorAction Stop
+    $params = New-Object Microsoft.Management.Infrastructure.CimMethodParametersCollection
+    $params.Add([Microsoft.Management.Infrastructure.CimMethodParameter]::Create('param', '', 'String', 'In'))
+    (New-CimSession).InvokeMethod($ns, $wipe, 'doWipeMethod', $params) | Out-Null
+    exit 0
+} catch { exit 1 }
+'@
+    $task = 'AutopilotEnroll-Reset'
+    $exe  = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $arg  = '-NoProfile -NonInteractive -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($call))
+    try {
+        Register-ScheduledTask -TaskName $task -Force `
+            -Action (New-ScheduledTaskAction -Execute $exe -Argument $arg) `
+            -Principal (New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest) | Out-Null
+        Start-ScheduledTask -TaskName $task
+        # 267009 and 267011 mean the task is still running, or hasn't started.
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            Start-Sleep -Seconds 2
+            $result = (Get-ScheduledTaskInfo -TaskName $task).LastTaskResult
+        } while ($result -in 267009, 267011 -and $timer.Elapsed.TotalSeconds -lt 120)
+    } catch {
+        Write-Warn "Could not run the reset as SYSTEM: $($_.Exception.Message)"
+        return $false
+    } finally {
+        Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+    }
+
+    if ($result -ne 0) {
+        Write-Warn ('The RemoteWipe CSP did not start the reset (result 0x{0:X}).' -f $result)
+        return $false
+    }
+    Write-Ok 'Reset started.'
+    return $true
+}
+
+function Wait-ForReset {
+    # Windows closes this window when it restarts to reset. Returns if that
+    # hasn't happened within the time given.
+    param([int]$Seconds, [string]$ActionText)
+    $limit = [TimeSpan]::FromSeconds($Seconds)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ($timer.Elapsed -lt $limit) {
+        Write-Host ("`r  {0}... {1:mm\:ss}   " -f $ActionText, ($limit - $timer.Elapsed)) -NoNewline -ForegroundColor DarkGray
+        Start-Sleep -Seconds 1
+    }
+    Write-Host ''
+}
+
+function Invoke-DeviceWipe {
+    # Resets the device to a clean OOBE, keeping its Autopilot registration.
+    # Prefers a wipe from Intune, falling back to running the same reset
+    # locally. Only returns if the device hasn't restarted to reset: $true
+    # if Reset this PC is open for the technician to finish, else $false.
+    param([string]$Token, [string]$Serial)
+
+    if (-not (Enable-WinRE)) { return $false }
+
+    Write-Host ''
+    Write-Host '   Do not power the device off. It will restart, reset itself, and'
+    Write-Host '   come back at a fresh OOBE ready for its user.'
+    Write-Host ''
+
+    if (Invoke-IntuneWipe -Token $Token -Serial $Serial) {
+        foreach ($attempt in 1..2) {
+            Start-IntuneSync
+            Wait-ForReset -Seconds 150 -ActionText 'Waiting for the device to receive the wipe from Intune'
+        }
+        Write-Warn 'The wipe has not arrived from Intune yet. Resetting the device locally instead.'
+    }
+
+    if (Invoke-LocalWipe) {
+        Wait-ForReset -Seconds 180 -ActionText 'Waiting for the device to restart and reset'
+        Write-Warn 'The device has not restarted to reset.'
+    }
+
+    # Last resort: open Reset this PC for the technician to click through.
+    $sysreset = Join-Path $env:SystemRoot 'System32\systemreset.exe'
+    foreach ($resetArg in '--factoryreset','-factoryreset') {
+        try {
+            Write-Warn "Opening Reset this PC (systemreset.exe $resetArg)"
+            Start-Process -FilePath $sysreset -ArgumentList $resetArg -ErrorAction Stop
+            Start-Sleep -Seconds 10
+            if (Get-Process -Name systemreset -ErrorAction SilentlyContinue) { return $true }
+            Write-Warn 'systemreset.exe exited immediately.'
+        } catch {
+            Write-Warn "systemreset.exe $resetArg failed: $($_.Exception.Message)"
+        }
+    }
     return $false
 }
 
@@ -705,7 +816,12 @@ function Write-QrLine {
 # The technician signs in on their phone. The token only ever exists in
 # this PowerShell session's memory and is gone when the window closes.
 
-$GraphScope = 'https://graph.microsoft.com/DeviceManagementServiceConfig.ReadWrite.All'
+# .default gets whichever Graph permissions an admin has granted the app
+# registration, without asking for any that haven't been granted yet:
+#   DeviceManagementServiceConfig.ReadWrite.All             register devices, set group tags
+#   DeviceManagementManagedDevices.Read.All                 } optional: reset devices by
+#   DeviceManagementManagedDevices.PrivilegedOperations.All } wiping them from Intune
+$GraphScope = 'https://graph.microsoft.com/.default'
 
 function Get-AadErrorText {
     # The readable part of an Entra ID error response.
@@ -806,9 +922,10 @@ function Connect-Intune {
     Show-SignInPrompt -Uri $dc.verification_uri -Code $dc.user_code -GroupTag $GroupTag
 
     $interval = [Math]::Max(1, [int]$dc.interval)
-    $deadline = (Get-Date).AddSeconds([int]$dc.expires_in)
-    while ((Get-Date) -lt $deadline) {
-        Write-Host ("`r  Waiting for sign-in... the code expires in {0:mm\:ss}   " -f ($deadline - (Get-Date))) `
+    $expiry   = [TimeSpan]::FromSeconds([int]$dc.expires_in)
+    $timer    = [Diagnostics.Stopwatch]::StartNew()   # see Wait-ProfileAssignment for why not Get-Date
+    while ($timer.Elapsed -lt $expiry) {
+        Write-Host ("`r  Waiting for sign-in... the code expires in {0:mm\:ss}   " -f ($expiry - $timer.Elapsed)) `
             -NoNewline -ForegroundColor DarkGray
         Start-Sleep -Seconds $interval
         try {
@@ -835,17 +952,55 @@ function Connect-Intune {
 
 # --- Microsoft Graph helpers ----------------------------------------
 
+function Get-GraphStatus {
+    # The HTTP status of a failed request, or $null if there was no response.
+    param($ErrorRecord)
+    $response = $ErrorRecord.Exception.Response
+    if ($response) { return [int]$response.StatusCode }
+    return $null
+}
+
 function Get-GraphErrorText {
     param($ErrorRecord)
-    $status = $null
-    try { $status = [int]$ErrorRecord.Exception.Response.StatusCode } catch { }
+    $status = Get-GraphStatus $ErrorRecord
     $text = $null
     try { $text = ($ErrorRecord.ErrorDetails.Message | ConvertFrom-Json).error.message } catch { }
     if (-not $text) { $text = $ErrorRecord.Exception.Message }
-    if ($status -eq 401 -or $status -eq 403) {
-        return "Access denied ($status). The signed-in account needs an Intune role that can manage Autopilot devices. $text"
+    if ($status -eq 401) {
+        return "The sign-in has expired (401). Run the script again to sign in again. $text"
+    }
+    if ($status -eq 403) {
+        return ("Access denied (403). The signed-in account needs an Intune role that allows this, " +
+                "and the app registration needs the Graph permission for it. $text")
     }
     return $text
+}
+
+function Invoke-Graph {
+    # Invoke-RestMethod for Graph, with a timeout. A GET is retried a few
+    # times if Graph is throttling (429), has a server error (5xx) or the
+    # connection drops, so one hiccup doesn't, say, send an already
+    # registered device down the new-device path. Other methods aren't
+    # retried, as repeating them may not be safe.
+    param([string]$Token, [string]$Uri, [string]$Method = 'GET', [string]$Body)
+
+    $request = @{ Uri = $Uri; Method = $Method; TimeoutSec = 60; Headers = @{ Authorization = "Bearer $Token" } }
+    if ($Body) { $request.Body = $Body; $request.ContentType = 'application/json; charset=utf-8' }
+
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            return Invoke-RestMethod @request
+        } catch {
+            $status = Get-GraphStatus $_
+            if ($Method -ne 'GET' -or $attempt -ge 4 -or ($status -and $status -ne 429 -and $status -lt 500)) { throw }
+            $wait = 10 * $attempt
+            try {
+                $retryAfter = [int]$_.Exception.Response.Headers['Retry-After']
+                if ($retryAfter -gt 0) { $wait = [Math]::Min($retryAfter, 60) }
+            } catch { }
+            Start-Sleep -Seconds $wait
+        }
+    }
 }
 
 function Get-AutopilotDeviceBySerial {
@@ -856,7 +1011,7 @@ function Get-AutopilotDeviceBySerial {
     $filter  = [uri]::EscapeDataString("contains(serialNumber,'$literal')")
     $uri     = "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities?`$filter=$filter"
 
-    $resp = Invoke-RestMethod -Uri $uri -Method GET -Headers @{ Authorization = "Bearer $Token" }
+    $resp = Invoke-Graph -Token $Token -Uri $uri
     return $resp.value | Where-Object { $_.serialNumber -eq $Serial } | Select-Object -First 1
 }
 
@@ -865,21 +1020,20 @@ function Set-AutopilotGroupTag {
 
     $uri  = "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities/$Id/updateDeviceProperties"
     $body = @{ groupTag = $GroupTag } | ConvertTo-Json
-    Invoke-RestMethod -Uri $uri -Method POST -Body $body `
-        -Headers @{ Authorization = "Bearer $Token"; 'Content-Type' = 'application/json' } | Out-Null
+    Invoke-Graph -Token $Token -Method POST -Uri $uri -Body $body | Out-Null
 }
 
 function Invoke-AutopilotSync {
     param([string]$Token)
     # Best effort - the service throttles this to roughly once every 10 minutes.
     try {
-        Invoke-RestMethod -Method POST -Headers @{ Authorization = "Bearer $Token" } `
+        Invoke-Graph -Token $Token -Method POST `
             -Uri 'https://graph.microsoft.com/beta/deviceManagement/windowsAutopilotSettings/sync' | Out-Null
     } catch { }
 }
 
 function Get-HardwareHash {
-    # Same MDM WMI bridge (root\cimv2\mdm\dmmap) that Invoke-DeviceWipe uses.
+    # Same MDM WMI bridge (root\cimv2\mdm\dmmap) that Invoke-LocalWipe uses.
     # DeviceHardwareData is the base64 hardware hash from the DevDetail CSP.
     $detail = Get-CimInstance -Namespace 'root\cimv2\mdm\dmmap' -ClassName MDM_DevDetail_Ext01 `
                 -Filter "InstanceID='Ext' AND ParentID='./DevDetail'"
@@ -894,24 +1048,22 @@ function Import-AutopilotDevice {
     # reject it. Throws with the service's reason if it wasn't accepted.
     param([string]$Token, [string]$Serial, [string]$Hash, [string]$GroupTag)
 
-    $base    = 'https://graph.microsoft.com/v1.0/deviceManagement/importedWindowsAutopilotDeviceIdentities'
-    $headers = @{ Authorization = "Bearer $Token" }
-    $body    = @{
+    $base = 'https://graph.microsoft.com/v1.0/deviceManagement/importedWindowsAutopilotDeviceIdentities'
+    $body = @{
         '@odata.type'      = '#microsoft.graph.importedWindowsAutopilotDeviceIdentity'
         serialNumber       = $Serial
         hardwareIdentifier = $Hash        # already base64, which is what Graph expects
         groupTag           = $GroupTag
     } | ConvertTo-Json
 
-    $import = Invoke-RestMethod -Method POST -Uri $base -Headers $headers `
-                -ContentType 'application/json; charset=utf-8' -Body $body
+    $import = Invoke-Graph -Token $Token -Method POST -Uri $base -Body $body
 
     # The import runs in the background. Poll until the service reports a result.
-    $deadline = (Get-Date).AddMinutes(10)
-    while ($import.state.deviceImportStatus -in 'unknown', 'pending' -and (Get-Date) -lt $deadline) {
+    $timer = [Diagnostics.Stopwatch]::StartNew()   # see Wait-ProfileAssignment for why not Get-Date
+    while ($import.state.deviceImportStatus -in 'unknown', 'pending' -and $timer.Elapsed.TotalMinutes -lt 10) {
         Write-Host '.' -NoNewline -ForegroundColor DarkGray
         Start-Sleep -Seconds 15
-        $import = Invoke-RestMethod -Uri "$base/$($import.id)" -Headers $headers
+        $import = Invoke-Graph -Token $Token -Uri "$base/$($import.id)"
     }
     Write-Host ''
     $state = $import.state
@@ -922,7 +1074,7 @@ function Import-AutopilotDevice {
     }
 
     # The import record only tracks status. Clean it up whatever the result.
-    try { Invoke-RestMethod -Method DELETE -Uri "$base/$($import.id)" -Headers $headers | Out-Null } catch { }
+    try { Invoke-Graph -Token $Token -Method DELETE -Uri "$base/$($import.id)" | Out-Null } catch { }
 
     if ($state.deviceImportStatus -ne 'complete') {
         throw ("The Autopilot service rejected the upload: $($state.deviceErrorName) " +
@@ -930,39 +1082,51 @@ function Import-AutopilotDevice {
     }
 }
 
-function Wait-AutopilotDevice {
-    # After an import the device appears in Intune's Autopilot device list
-    # once the service syncs. Returns the device, or $null on timeout.
-    param([string]$Token, [string]$Serial, [int]$Minutes)
-
-    Invoke-AutopilotSync -Token $Token
-    $deadline = (Get-Date).AddMinutes($Minutes)
-    do {
-        $device = $null
-        try { $device = Get-AutopilotDeviceBySerial -Token $Token -Serial $Serial } catch { }
-        if ($device) { Write-Host ''; return $device }
-        Write-Host '.' -NoNewline -ForegroundColor DarkGray
-        Start-Sleep -Seconds 20
-    } while ((Get-Date) -lt $deadline)
-    Write-Host ''
-    return $null
-}
-
 function Wait-ProfileAssignment {
-    # deploymentProfileAssignmentStatus is only in the Graph beta endpoint.
-    param([string]$Token, [string]$Id, [int]$Minutes)
+    # Waits for Intune to list the device, if it hasn't yet (a new device
+    # can take up to 10 minutes), and then to assign it an Autopilot
+    # profile. Returns $true once a profile is assigned.
+    #
+    # Waits are timed with a stopwatch, not Get-Date: Windows can correct
+    # the clock or time zone soon after OOBE gets online, which would move
+    # a Get-Date deadline by hours - ending a wait at once, or making it
+    # run far too long.
+    param([string]$Token, [string]$Serial, [string]$Id, [int]$Minutes)
 
-    $uri = "https://graph.microsoft.com/beta/deviceManagement/windowsAutopilotDeviceIdentities/$Id"
-    $deadline = (Get-Date).AddMinutes($Minutes)
+    $timer  = [Diagnostics.Stopwatch]::StartNew()
+    $status = $null
     do {
         try {
-            $device = Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $Token" }
-            if ($device.deploymentProfileAssignmentStatus -like 'assigned*') { Write-Host ''; return $true }
-        } catch { }
+            if (-not $Id) {
+                $device = Get-AutopilotDeviceBySerial -Token $Token -Serial $Serial
+                if ($device) {
+                    $Id = $device.id
+                    Write-Host ''
+                    Write-Ok 'The device is listed in Intune.'
+                }
+            }
+            if ($Id) {
+                # deploymentProfileAssignmentStatus is only in the Graph beta endpoint.
+                $device = Invoke-Graph -Token $Token -Uri "https://graph.microsoft.com/beta/deviceManagement/windowsAutopilotDeviceIdentities/$Id"
+                if ($device.deploymentProfileAssignmentStatus -ne $status) {
+                    $status = $device.deploymentProfileAssignmentStatus
+                    Write-Host ''
+                    Write-Host "  Profile status: $status" -ForegroundColor DarkGray
+                }
+                if ($status -like 'assigned*') { return $true }
+            }
+        } catch {
+            Write-Host ''
+            Write-Warn "Could not check for the profile: $(Get-GraphErrorText $_)"
+            # Waiting longer won't fix an expired sign-in or missing access.
+            if ((Get-GraphStatus $_) -in 401, 403) { return $false }
+        }
         Write-Host '.' -NoNewline -ForegroundColor DarkGray
         Start-Sleep -Seconds 30
-    } while ((Get-Date) -lt $deadline)
+    } while ($timer.Elapsed.TotalMinutes -lt $Minutes)
+
     Write-Host ''
+    Write-Warn "No Autopilot profile assigned after $Minutes minutes."
     return $false
 }
 
@@ -1116,16 +1280,7 @@ if (-not $existing) {
         Write-Fail "Upload failed: $(Get-GraphErrorText $_)"
     }
 
-    if ($uploadOk) {
-        Write-Step 'Waiting for the device to appear in Intune'
-        $registered = Wait-AutopilotDevice -Token $graphToken -Serial $Serial -Minutes 10
-        if ($registered) {
-            Write-Ok 'The device is listed in Intune.'
-        } else {
-            Write-Warn 'The device is registered but not listed in Intune yet. It usually'
-            Write-Warn 'appears within a few minutes.'
-        }
-    }
+    if ($uploadOk) { Invoke-AutopilotSync -Token $graphToken }
 }
 
 
@@ -1134,16 +1289,18 @@ if (-not $existing) {
 # Autopilot, so don't report COMPLETE, restart or reset until it has one.
 
 $profileOk = -not $WaitForProfileAssignment
-$deviceId  = if ($existing) { $existing.id } elseif ($registered) { $registered.id }
 
-if ($uploadOk -and -not $profileOk -and $deviceId) {
-    Write-Step 'Waiting for the Autopilot profile to be assigned (can take 10-15 minutes)'
-    $profileOk = Wait-ProfileAssignment -Token $graphToken -Id $deviceId -Minutes 30
-    if ($profileOk) {
-        Write-Ok 'Autopilot profile assigned.'
+if ($uploadOk -and -not $profileOk) {
+    # A new device has to be listed in Intune first, so it gets longer.
+    if ($existing) {
+        Write-Step 'Waiting for the Autopilot profile to be assigned (can take 10-15 minutes)'
+        $minutes = 30
     } else {
-        Write-Warn 'No Autopilot profile assigned after 30 minutes.'
+        Write-Step 'Waiting for Intune to list the device and assign its Autopilot profile (can take 15-20 minutes)'
+        $minutes = 40
     }
+    $profileOk = Wait-ProfileAssignment -Token $graphToken -Serial $Serial -Id $existing.id -Minutes $minutes
+    if ($profileOk) { Write-Ok 'Autopilot profile assigned.' }
 }
 
 
@@ -1204,18 +1361,17 @@ if ($uploadOk -and $profileOk) {
     }
 
     Write-Step 'Resetting the device...'
-    if (Invoke-DeviceWipe) {
+    if (Invoke-DeviceWipe -Token $graphToken -Serial $Serial) {
         Write-Host ''
-        Write-Host '   Do not power the device off. It will restart, reset, and come'
-        Write-Host '   back at a fresh OOBE ready for the end user to sign in.'
-        try { Stop-Transcript | Out-Null } catch { }
-        Start-Sleep -Seconds 5
-        exit 0
+        Write-Host '   The device could not reset itself, so Reset this PC is open.' -ForegroundColor Yellow
+        Write-Host '   Choose: Remove everything.'                                    -ForegroundColor Yellow
+        Exit-Script -Code 2
     } else {
-        Write-Fail 'Automatic reset could not be started.'
+        Write-Fail 'The device could not be reset automatically.'
         Write-Host  '   The device IS registered with Autopilot, so nothing is lost.'
         Write-Host  '   Please reset it manually: Settings > System > Recovery >'
-        Write-Host  '   Reset this PC > Remove everything.'
+        Write-Host  '   Reset this PC > Remove everything. If that fails too, reinstall'
+        Write-Host  '   Windows from USB media - Autopilot will still apply afterwards.'
         Exit-Script -Code 2
     }
 } elseif ($uploadOk) {
