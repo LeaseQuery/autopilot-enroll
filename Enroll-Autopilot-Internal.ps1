@@ -18,7 +18,9 @@
    4. Waits for Intune to assign an Autopilot profile (usually 10-15
       minutes). If none is assigned within 30 minutes (40 for a new
       device, which Intune has to list first), it stops without
-      restarting or resetting - run it again later.
+      restarting or resetting - run it again later. After a group tag
+      change it also waits for the device's old profile to change
+      (up to 15 minutes; see $TagChangeGraceMinutes).
    5. Writes a log file - next to this script on a flash drive,
       otherwise in C:\ProgramData\AutopilotEnroll.
    6. Hands the device back to a clean OOBE:
@@ -69,6 +71,12 @@ $TagSelectTimeoutSeconds = 15
 # again later.
 $WaitForProfileAssignment = $true
 
+# After a group tag change, Intune keeps showing the device's old profile
+# until Entra moves the device into its new groups. The script waits up
+# to this many minutes for the profile to change. If it hasn't, the new
+# tag is taken to use the same profile, and the script continues.
+$TagChangeGraceMinutes = 15
+
 # What to do after a SUCCESSFUL upload:
 #   'Auto'   - restart if the device is still in OOBE (nothing to reset),
 #              otherwise reset it back to a clean OOBE  [default]
@@ -87,7 +95,7 @@ $CountdownSeconds = 30
 #  Nothing below here needs editing.
 # ===================================================================
 
-$ScriptVersion = '2026-10-15.2-internal'   # bump when editing, then update the hash in go.ps1
+$ScriptVersion = '2026-10-15.3-internal'   # bump when editing, then update the hash in go.ps1
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
@@ -1082,16 +1090,36 @@ function Import-AutopilotDevice {
     }
 }
 
+function Get-AutopilotProfiles {
+    # The device's profile status, the profile it has, and the profile
+    # Intune intends it to have. deploymentProfileAssignmentStatus is only
+    # in the Graph beta endpoint.
+    param([string]$Token, [string]$Id)
+
+    $uri = "https://graph.microsoft.com/beta/deviceManagement/windowsAutopilotDeviceIdentities/$Id"
+    try {
+        return Invoke-Graph -Token $Token -Uri "$($uri)?`$expand=deploymentProfile,intendedDeploymentProfile"
+    } catch {
+        if ((Get-GraphStatus $_) -ne 400) { throw }
+        return Invoke-Graph -Token $Token -Uri $uri   # status only
+    }
+}
+
 function Wait-ProfileAssignment {
     # Waits for Intune to list the device, if it hasn't yet (a new device
     # can take up to 10 minutes), and then to assign it an Autopilot
-    # profile. Returns $true once a profile is assigned.
+    # profile. Returns $true once it has one.
     #
-    # Intune can report a status of 'unknown' for a device that has its
-    # profile, so the status alone isn't enough. A device also counts as
-    # ready once the profile it has is the one Intune intends it to have -
-    # unless its group tag was just changed (-TagChanged), when the old
-    # profile can still look intended until its groups update.
+    # The device is ready when the profile it has is the one Intune intends
+    # it to have. The status alone isn't enough: Intune can report 'unknown'
+    # for a device that has its profile.
+    #
+    # After a group tag change (-TagChanged), Intune keeps reporting the old
+    # profile as assigned and intended until Entra moves the device into
+    # its new groups. So the device also has to move off the profile it had
+    # at the first check - moments after the change, before Entra can have
+    # updated anything. If it's still on that profile after
+    # $TagChangeGraceMinutes, the new tag is taken to use the same profile.
     #
     # Waits are timed with a stopwatch, not Get-Date: Windows can correct
     # the clock or time zone soon after OOBE gets online, which would move
@@ -1099,8 +1127,10 @@ function Wait-ProfileAssignment {
     # run far too long.
     param([string]$Token, [string]$Serial, [string]$Id, [int]$Minutes, [switch]$TagChanged)
 
-    $timer = [Diagnostics.Stopwatch]::StartNew()
-    $shown = $null
+    $timer     = [Diagnostics.Stopwatch]::StartNew()
+    $shown     = $null
+    $oldId     = $null
+    $firstLook = $true
     do {
         try {
             if (-not $Id) {
@@ -1112,17 +1142,18 @@ function Wait-ProfileAssignment {
                 }
             }
             if ($Id) {
-                # deploymentProfileAssignmentStatus is only in the Graph beta endpoint.
-                $uri = "https://graph.microsoft.com/beta/deviceManagement/windowsAutopilotDeviceIdentities/$Id"
-                try {
-                    $device = Invoke-Graph -Token $Token -Uri "$($uri)?`$expand=deploymentProfile,intendedDeploymentProfile"
-                } catch {
-                    if ((Get-GraphStatus $_) -ne 400) { throw }
-                    $device = Invoke-Graph -Token $Token -Uri $uri   # status only
-                }
+                $device   = Get-AutopilotProfiles -Token $Token -Id $Id
                 $status   = $device.deploymentProfileAssignmentStatus
                 $assigned = $device.deploymentProfile
                 $intended = $device.intendedDeploymentProfile
+
+                if ($TagChanged -and $firstLook) {
+                    $oldId = $assigned.id
+                    $old   = if ($assigned) { $assigned.displayName } else { 'none' }
+                    Write-Host ''
+                    Write-Host "  Profile before the tag change: $old. Waiting up to $TagChangeGraceMinutes minutes for it to change." -ForegroundColor DarkGray
+                }
+                $firstLook = $false
 
                 $now = "{0} (has: {1}; intended: {2})" -f $status,
                        $(if ($assigned) { $assigned.displayName } else { 'none' }),
@@ -1133,8 +1164,25 @@ function Wait-ProfileAssignment {
                     Write-Host "  Profile status: $now" -ForegroundColor DarkGray
                 }
 
-                $asIntended = $assigned.id -and $assigned.id -eq $intended.id
-                if ($status -like 'assigned*' -or ($asIntended -and -not $TagChanged)) {
+                if ($assigned -and $intended) {
+                    $ready = $assigned.id -eq $intended.id -and
+                             $status -notin 'assignedOutOfSync', 'pending', 'failed', 'notAssigned'
+                } else {
+                    # No profile details, so go by the status ('Unkown' is Graph's spelling).
+                    $ready = $status -in 'assignedInSync', 'assignedUnkownSyncState'
+                }
+
+                if ($ready -and $TagChanged -and (-not $assigned -or $assigned.id -eq $oldId)) {
+                    if ($timer.Elapsed.TotalMinutes -lt $TagChangeGraceMinutes) {
+                        $ready = $false
+                    } else {
+                        Write-Host ''
+                        Write-Warn ("The profile hasn't changed after $TagChangeGraceMinutes minutes, so the new " +
+                                    'group tag seems to use the same profile. Continuing.')
+                    }
+                }
+
+                if ($ready) {
                     $name = if ($assigned) { $assigned.displayName } else { '(name not available)' }
                     Write-Host ''
                     Write-Ok "Autopilot profile assigned: $name"

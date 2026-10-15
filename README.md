@@ -28,7 +28,9 @@ Registers a Windows device with Windows Autopilot, applies its group tag, and ha
 
 If the screen says **PROFILE NOT ASSIGNED**, the device is registered but didn't get an Autopilot profile in time (30 minutes, or 40 for a new device). It isn't restarted or reset. Run the script again in a few minutes: it finds the device already registered and only waits for the profile. While it waits, the screen shows the profile status Intune reports, the profile the device has, and the profile Intune intends it to have. These are also in the log.
 
-If the device is already registered with the same group tag and already has the profile Intune intends it to have, the script continues straight away, even if Intune reports the status as `unknown`.
+The script continues once the device has the profile Intune intends it to have, even if Intune reports the status as `unknown`. If the device is already registered with the same group tag and already has that profile, that's straight away.
+
+If you change a device's group tag, Intune keeps showing its old profile until Entra moves the device into its new groups. So the script also waits for the device's profile to change. If it hasn't changed after 15 minutes, the script takes it that the new tag uses the same profile, and continues. To change the 15 minutes, set `$TagChangeGraceMinutes` in the script.
 
 If enrollment fails, nothing on the device is changed. Note the message on screen and check the log.
 
